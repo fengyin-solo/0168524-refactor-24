@@ -1,4 +1,5 @@
 import type { MessageStats } from '../types';
+import { estimateTokens } from '../utils/tokenCounter';
 
 /**
  * 响应统计信息
@@ -8,20 +9,80 @@ export interface ResponseStats {
   responseTime: number;
   /** 估算的 Token 数量 */
   tokenCount: number;
+  /** 已接收内容长度 */
+  contentLength: number;
   /** 首字节时间（毫秒） */
   firstByteTime?: number;
+  /** 是否由取消操作收尾 */
+  canceled?: boolean;
 }
 
 /**
  * 流处理器回调
  */
 export interface StreamCallbacks {
-  /** 收到内容片段时调用 */
-  onChunk: (chunk: string) => void;
+  /** 收到内容片段时调用，第二个参数为当前完整内容 */
+  onChunk: (chunk: string, content: string) => void;
   /** 流完成时调用 */
   onComplete: (stats: ResponseStats) => void;
   /** 发生错误时调用 */
   onError: (error: Error) => void;
+}
+
+export type AsyncStream = AsyncGenerator<string, void, unknown>;
+export type StreamFactory = (signal: AbortSignal) => AsyncStream | Promise<AsyncStream>;
+export type StreamSource = AsyncStream | StreamFactory;
+
+export interface StreamAbortResult {
+  content: string;
+  stats: ResponseStats;
+}
+
+/**
+ * 流式内容累积器
+ * 所有入口共用同一份内容、长度和时间统计逻辑
+ */
+export class StreamAccumulator {
+  private readonly startTime: number;
+  private firstByteTime: number | null = null;
+  private accumulatedContent = '';
+
+  constructor(startTime: number = Date.now()) {
+    this.startTime = startTime;
+  }
+
+  append(chunk: string, receiveTime: number = Date.now()): string {
+    if (this.firstByteTime === null) {
+      this.firstByteTime = receiveTime - this.startTime;
+    }
+
+    this.accumulatedContent += chunk;
+    return this.accumulatedContent;
+  }
+
+  getContent(): string {
+    return this.accumulatedContent;
+  }
+
+  getStats(endTime: number = Date.now(), canceled = false): ResponseStats {
+    const stats: ResponseStats = {
+      responseTime: endTime - this.startTime,
+      tokenCount: estimateTokens(this.accumulatedContent),
+      contentLength: this.accumulatedContent.length,
+      firstByteTime: this.firstByteTime ?? undefined,
+    };
+
+    if (canceled) {
+      stats.canceled = true;
+    }
+
+    return stats;
+  }
+}
+
+interface ActiveStream {
+  controller: AbortController;
+  accumulator: StreamAccumulator;
 }
 
 /**
@@ -29,117 +90,95 @@ export interface StreamCallbacks {
  * 管理流式响应的生命周期
  */
 export class StreamHandler {
-  private abortController: AbortController | null = null;
-  private isActive = false;
-  private startTime = 0;
-  private firstByteTime: number | null = null;
-  private accumulatedContent = '';
+  private activeStream: ActiveStream | null = null;
 
   /**
    * 开始处理流
-   * @param stream 异步迭代器
+   * @param streamOrFactory 异步迭代器，或接收 AbortSignal 后创建迭代器的工厂
    * @param callbacks 回调函数
    */
   async start(
-    stream: AsyncGenerator<string, void, unknown>,
+    streamOrFactory: StreamSource,
     callbacks: StreamCallbacks
   ): Promise<void> {
-    if (this.isActive) {
-      this.abort();
+    // 新的一轮开始时完全替换旧状态，避免上一条回复的统计或内容带入本轮
+    if (this.activeStream) {
+      this.activeStream.controller.abort();
     }
 
-    this.abortController = new AbortController();
-    this.isActive = true;
-    this.startTime = Date.now();
-    this.firstByteTime = null;
-    this.accumulatedContent = '';
+    const controller = new AbortController();
+    const accumulator = new StreamAccumulator();
+    const currentStream: ActiveStream = { controller, accumulator };
+    this.activeStream = currentStream;
 
     try {
+      const stream =
+        typeof streamOrFactory === 'function'
+          ? await streamOrFactory(controller.signal)
+          : streamOrFactory;
+
       for await (const chunk of stream) {
-        // 检查是否已中止
-        if (this.abortController?.signal.aborted) {
+        if (currentStream.controller.signal.aborted) {
           break;
         }
 
-        // 记录首字节时间
-        if (this.firstByteTime === null) {
-          this.firstByteTime = Date.now() - this.startTime;
-        }
-
-        this.accumulatedContent += chunk;
-        callbacks.onChunk(chunk);
+        const content = accumulator.append(chunk);
+        callbacks.onChunk(chunk, content);
       }
 
-      // 流正常完成
-      if (!this.abortController?.signal.aborted) {
-        const stats = this.calculateStats();
-        callbacks.onComplete(stats);
+      if (
+        this.activeStream === currentStream &&
+        !currentStream.controller.signal.aborted
+      ) {
+        callbacks.onComplete(accumulator.getStats());
       }
     } catch (error) {
-      if (!this.abortController?.signal.aborted) {
+      if (
+        this.activeStream === currentStream &&
+        !currentStream.controller.signal.aborted
+      ) {
         callbacks.onError(error instanceof Error ? error : new Error(String(error)));
       }
     } finally {
-      this.isActive = false;
-      this.abortController = null;
+      if (this.activeStream === currentStream) {
+        this.activeStream = null;
+      }
     }
   }
 
   /**
-   * 中止当前流
+   * 中止当前流，并返回已经累积的内容和截至取消时刻的统计
    */
-  abort(): void {
-    if (this.abortController) {
-      this.abortController.abort();
-      this.isActive = false;
+  abort(): StreamAbortResult | null {
+    const currentStream = this.activeStream;
+    if (!currentStream) {
+      return null;
     }
+
+    const { controller, accumulator } = currentStream;
+    const result = {
+      content: accumulator.getContent(),
+      stats: accumulator.getStats(Date.now(), true),
+    };
+
+    controller.abort();
+    this.activeStream = null;
+
+    return result;
   }
 
   /**
    * 检查流是否正在处理
    */
   getIsActive(): boolean {
-    return this.isActive;
+    return this.activeStream !== null;
   }
 
   /**
-   * 获取已累积的内容
+   * 获取当前流已累积的内容
    */
   getAccumulatedContent(): string {
-    return this.accumulatedContent;
-  }
-
-  /**
-   * 计算响应统计信息
-   */
-  private calculateStats(): ResponseStats {
-    const responseTime = Date.now() - this.startTime;
-    const tokenCount = this.estimateTokens(this.accumulatedContent);
-
-    return {
-      responseTime,
-      tokenCount,
-      firstByteTime: this.firstByteTime ?? undefined,
-    };
-  }
-
-  /**
-   * 估算 Token 数量
-   * 简化的估算方法
-   */
-  private estimateTokens(text: string): number {
-    if (!text) return 0;
-
-    // 中文字符约 2 token
-    const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-    // 英文单词约 1 token
-    const englishWords = (text.match(/[a-zA-Z]+/g) || []).length;
-    // 数字
-    const numbers = (text.match(/\d+/g) || []).length;
-    // 标点符号
-    const punctuation = (text.match(/[^\w\s\u4e00-\u9fff]/g) || []).length;
-
-    return chineseChars * 2 + englishWords + numbers + punctuation;
+    return this.activeStream?.accumulator.getContent() ?? '';
   }
 }
 
@@ -157,5 +196,7 @@ export function toMessageStats(stats: ResponseStats): MessageStats {
   return {
     responseTime: stats.responseTime,
     tokenCount: stats.tokenCount,
+    contentLength: stats.contentLength,
+    firstByteTime: stats.firstByteTime,
   };
 }

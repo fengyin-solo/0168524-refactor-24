@@ -1,15 +1,12 @@
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { message } from 'antd';
 import { useChatStore } from '../stores/chatStore';
 import { useConfigStore } from '../stores/configStore';
 import { useUIStore } from '../stores/uiStore';
 import { sendMessageStream } from '../services/api';
-import { createStreamHandler, toMessageStats } from '../services/stream';
+import { createStreamHandler, toMessageStats, type StreamAbortResult } from '../services/stream';
 import { parseError, logError, shouldShowConfigPanel } from '../services/errorHandler';
 import type { APIMessage } from '../types';
-
-// 创建流处理器实例
-const streamHandler = createStreamHandler();
 
 /**
  * 聊天功能 Hook
@@ -33,7 +30,7 @@ export function useChat() {
 
   const { config, isValid: isConfigValid } = useConfigStore();
   const { setConfigPanelVisible } = useUIStore();
-
+  const streamHandlerRef = useRef(createStreamHandler());
   const conversation = getActiveConversation();
   const messages = conversation?.messages || [];
 
@@ -42,19 +39,22 @@ export function useChat() {
    */
   const sendMessage = useCallback(
     async (content: string) => {
-      if (!activeConversationId) {
-        message.warning('请先创建或选择一个对话');
-        return;
-      }
-
       if (!isConfigValid) {
         message.warning('请先配置 API Key');
         setConfigPanelVisible(true);
         return;
       }
 
+      const conversationId = activeConversationId ?? createConversation();
+
+      // 从 store 读取添加本轮用户消息之前的历史，避免闭包中的 messages 少一轮
+      const historyMessages =
+        useChatStore
+          .getState()
+          .conversations.find((conv) => conv.id === conversationId)?.messages ?? [];
+
       // 添加用户消息
-      addMessage(activeConversationId, {
+      addMessage(conversationId, {
         role: 'user',
         content,
         status: 'complete',
@@ -62,7 +62,7 @@ export function useChat() {
 
       // 准备 API 消息
       const apiMessages: APIMessage[] = [
-        ...messages.map((msg) => ({
+        ...historyMessages.map((msg) => ({
           role: msg.role,
           content: msg.content,
         })),
@@ -70,48 +70,51 @@ export function useChat() {
       ];
 
       // 开始流式响应
-      startStreaming(activeConversationId);
+      startStreaming(conversationId);
 
-      try {
-        const stream = sendMessageStream(apiMessages, {
-          ...config,
-          stream: true,
-        });
-
-        await streamHandler.start(stream, {
-          onChunk: (chunk) => {
-            appendStreamContent(chunk);
-          },
-          onComplete: (stats) => {
-            finishStreaming(toMessageStats(stats));
-          },
-          onError: (error) => {
-            const appError = parseError(error);
-            logError(appError, 'useChat.sendMessage');
-            message.error(appError.message);
-            cancelStreaming();
-
-            if (shouldShowConfigPanel(appError)) {
-              setConfigPanelVisible(true);
-            }
-          },
-        });
-      } catch (error) {
+      const showStreamError = (error: unknown, source: string) => {
         const appError = parseError(error);
-        logError(appError, 'useChat.sendMessage');
+        logError(appError, source);
         message.error(appError.message);
         cancelStreaming();
 
         if (shouldShowConfigPanel(appError)) {
           setConfigPanelVisible(true);
         }
+      };
+
+      try {
+        await streamHandlerRef.current.start(
+          (signal) =>
+            sendMessageStream(
+              apiMessages,
+              {
+                ...config,
+                stream: true,
+              },
+              signal
+            ),
+          {
+            onChunk: (chunk, fullContent) => {
+              appendStreamContent(chunk, fullContent);
+            },
+            onComplete: (stats) => {
+              finishStreaming(toMessageStats(stats));
+            },
+            onError: (error) => {
+              showStreamError(error, 'useChat.sendMessage');
+            },
+          }
+        );
+      } catch (error) {
+        showStreamError(error, 'useChat.sendMessage');
       }
     },
     [
       activeConversationId,
       isConfigValid,
       config,
-      messages,
+      createConversation,
       addMessage,
       startStreaming,
       appendStreamContent,
@@ -125,9 +128,13 @@ export function useChat() {
    * 停止流式响应
    */
   const stopStreaming = useCallback(() => {
-    streamHandler.abort();
-    cancelStreaming();
-    message.info('已停止响应');
+    const result: StreamAbortResult | null = streamHandlerRef.current.abort();
+
+    if (result) {
+      // 使用共同累积结果收尾，保留已收到的内容，并维持原有的取消样式
+      cancelStreaming(result.content);
+      message.info('已停止响应');
+    }
   }, [cancelStreaming]);
 
   /**
@@ -137,10 +144,7 @@ export function useChat() {
     async (content?: string) => {
       const id = createConversation();
       if (content) {
-        // 等待状态更新后发送消息
-        setTimeout(() => {
-          sendMessage(content);
-        }, 0);
+        await sendMessage(content);
       }
       return id;
     },

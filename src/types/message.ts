@@ -16,6 +16,10 @@ export interface MessageStats {
   responseTime: number;
   /** Token 总数 */
   tokenCount: number;
+  /** 已接收内容长度 */
+  contentLength?: number;
+  /** 首字节时间（毫秒） */
+  firstByteTime?: number;
   /** 完成 Token 数 */
   completionTokens?: number;
   /** 提示 Token 数 */

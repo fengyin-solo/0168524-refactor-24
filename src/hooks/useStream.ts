@@ -1,8 +1,8 @@
-import { useState, useCallback, useRef } from 'react';
-import { StreamHandler, ResponseStats } from '../services/stream';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { StreamHandler, type ResponseStats, type StreamSource } from '../services/stream';
 
 interface UseStreamOptions {
-  onChunk?: (chunk: string) => void;
+  onChunk?: (chunk: string, content: string) => void;
   onComplete?: (stats: ResponseStats) => void;
   onError?: (error: Error) => void;
 }
@@ -12,7 +12,7 @@ interface UseStreamReturn {
   content: string;
   stats: ResponseStats | null;
   error: Error | null;
-  start: (stream: AsyncGenerator<string, void, unknown>) => Promise<void>;
+  start: (stream: StreamSource) => Promise<void>;
   stop: () => void;
   reset: () => void;
 }
@@ -27,52 +27,58 @@ export function useStream(options: UseStreamOptions = {}): UseStreamReturn {
   const [error, setError] = useState<Error | null>(null);
 
   const handlerRef = useRef<StreamHandler | null>(null);
+  const optionsRef = useRef(options);
 
-  const start = useCallback(
-    async (stream: AsyncGenerator<string, void, unknown>) => {
-      // 重置状态
-      setIsStreaming(true);
-      setContent('');
-      setStats(null);
-      setError(null);
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
 
-      // 创建新的处理器
-      const handler = new StreamHandler();
-      handlerRef.current = handler;
+  if (!handlerRef.current) {
+    handlerRef.current = new StreamHandler();
+  }
 
-      await handler.start(stream, {
-        onChunk: (chunk) => {
-          setContent((prev) => prev + chunk);
-          options.onChunk?.(chunk);
-        },
-        onComplete: (responseStats) => {
-          setStats(responseStats);
-          setIsStreaming(false);
-          options.onComplete?.(responseStats);
-        },
-        onError: (err) => {
-          setError(err);
-          setIsStreaming(false);
-          options.onError?.(err);
-        },
-      });
-    },
-    [options]
-  );
+  const start = useCallback(async (stream: StreamSource) => {
+    // 每一轮都从空白状态开始，避免上一条回复的内容或统计残留
+    setIsStreaming(true);
+    setContent('');
+    setStats(null);
+    setError(null);
+
+    await handlerRef.current?.start(stream, {
+      onChunk: (chunk, fullContent) => {
+        setContent(fullContent);
+        optionsRef.current.onChunk?.(chunk, fullContent);
+      },
+      onComplete: (responseStats) => {
+        setStats(responseStats);
+        setIsStreaming(false);
+        optionsRef.current.onComplete?.(responseStats);
+      },
+      onError: (err) => {
+        setError(err);
+        setIsStreaming(false);
+        optionsRef.current.onError?.(err);
+      },
+    });
+  }, []);
 
   const stop = useCallback(() => {
-    if (handlerRef.current) {
-      handlerRef.current.abort();
+    const result = handlerRef.current?.abort();
+    if (result) {
+      // 取消不清空已经收到的内容；下一次 start 会重新初始化
+      setContent(result.content);
+      setStats(result.stats);
       setIsStreaming(false);
     }
   }, []);
 
   const reset = useCallback(() => {
-    stop();
+    handlerRef.current?.abort();
+    setIsStreaming(false);
     setContent('');
     setStats(null);
     setError(null);
-  }, [stop]);
+  }, []);
 
   return {
     isStreaming,

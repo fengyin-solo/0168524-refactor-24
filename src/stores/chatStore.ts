@@ -34,12 +34,12 @@ interface ChatActions {
   updateMessage: (conversationId: string, messageId: string, updates: Partial<Message>) => void;
   /** 开始流式响应 */
   startStreaming: (conversationId: string) => string;
-  /** 追加流式内容 */
-  appendStreamContent: (content: string) => void;
+  /** 追加流式内容（回调同时提供当前完整内容时可直接使用） */
+  appendStreamContent: (content: string, fullContent?: string) => void;
   /** 完成流式响应 */
-  finishStreaming: (stats?: Message['stats']) => void;
+  finishStreaming: (stats?: Message['stats'], content?: string) => void;
   /** 取消流式响应 */
-  cancelStreaming: () => void;
+  cancelStreaming: (content?: string) => void;
   /** 获取当前活动对话 */
   getActiveConversation: () => Conversation | null;
   /** 清除所有对话 */
@@ -230,22 +230,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     return messageId;
   },
 
-  appendStreamContent: (content) => {
+  appendStreamContent: (content, fullContent) => {
     set(state => {
-      const newContent = state.streamingContent + content;
-      
-      // 同时更新消息内容
+      const newContent = fullContent ?? state.streamingContent + content;
+
+      // 流式累积器是内容的唯一权威来源，这里直接同步完整结果
       const conversations = state.conversations.map(conv => {
         if (conv.id !== state.activeConversationId) return conv;
-        
+
         const messages = conv.messages.map(msg => {
           if (msg.id !== state.streamingMessageId) return msg;
           return { ...msg, content: newContent };
         });
-        
+
         return { ...conv, messages };
       });
-      
+
       return {
         streamingContent: newContent,
         conversations,
@@ -253,30 +253,32 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  finishStreaming: (stats) => {
+  finishStreaming: (stats, content) => {
     set(state => {
+      const finalContent = content ?? state.streamingContent;
+
       const conversations = state.conversations.map(conv => {
         if (conv.id !== state.activeConversationId) return conv;
-        
+
         const messages = conv.messages.map(msg => {
           if (msg.id !== state.streamingMessageId) return msg;
           return {
             ...msg,
-            content: state.streamingContent,
+            content: finalContent,
             status: 'complete' as const,
             stats,
           };
         });
-        
+
         return {
           ...conv,
           messages,
           updatedAt: Date.now(),
         };
       });
-      
+
       debouncedSave(conversations);
-      
+
       return {
         conversations,
         isStreaming: false,
@@ -286,21 +288,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  cancelStreaming: () => {
+  cancelStreaming: (content) => {
     set(state => {
-      // 保留已接收的内容，但标记为错误状态
+      const finalContent = content ?? state.streamingContent;
+
+      // 取消时保留已经收到的内容；只有完全没有内容时才展示中断占位
       const conversations = state.conversations.map(conv => {
         if (conv.id !== state.activeConversationId) return conv;
-        
+
         const messages = conv.messages.map(msg => {
           if (msg.id !== state.streamingMessageId) return msg;
           return {
             ...msg,
-            content: state.streamingContent || '（响应已中断）',
+            content: finalContent || '（响应已中断）',
             status: 'error' as const,
           };
         });
-        
+
         return { ...conv, messages };
       });
       

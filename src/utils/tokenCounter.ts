@@ -61,7 +61,7 @@ export function estimateTokens(text: string): number {
     tokenCount += punctuation.length;
   }
   
-  return Math.max(1, tokenCount);
+  return tokenCount;
 }
 
 /**
