@@ -1,4 +1,5 @@
 import type { MessageStats } from '../types';
+import { estimateTokens } from '../utils/tokenCounter';
 
 /**
  * 响应统计信息
@@ -111,35 +112,18 @@ export class StreamHandler {
 
   /**
    * 计算响应统计信息
+   * Token 估算统一使用 utils/tokenCounter 中的实现，
+   * 保证与应用中其他地方对同一段文本的计数结果一致
    */
   private calculateStats(): ResponseStats {
     const responseTime = Date.now() - this.startTime;
-    const tokenCount = this.estimateTokens(this.accumulatedContent);
+    const tokenCount = estimateTokens(this.accumulatedContent);
 
     return {
       responseTime,
       tokenCount,
       firstByteTime: this.firstByteTime ?? undefined,
     };
-  }
-
-  /**
-   * 估算 Token 数量
-   * 简化的估算方法
-   */
-  private estimateTokens(text: string): number {
-    if (!text) return 0;
-
-    // 中文字符约 2 token
-    const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-    // 英文单词约 1 token
-    const englishWords = (text.match(/[a-zA-Z]+/g) || []).length;
-    // 数字
-    const numbers = (text.match(/\d+/g) || []).length;
-    // 标点符号
-    const punctuation = (text.match(/[^\w\s\u4e00-\u9fff]/g) || []).length;
-
-    return chineseChars * 2 + englishWords + numbers + punctuation;
   }
 }
 

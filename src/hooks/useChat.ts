@@ -8,7 +8,8 @@ import { createStreamHandler, toMessageStats } from '../services/stream';
 import { parseError, logError, shouldShowConfigPanel } from '../services/errorHandler';
 import type { APIMessage } from '../types';
 
-// 创建流处理器实例
+// 全局唯一的流处理器实例，所有入口共用，
+// 保证同一次回复只累积一次、只计算一次统计
 const streamHandler = createStreamHandler();
 
 /**
@@ -39,38 +40,50 @@ export function useChat() {
 
   /**
    * 发送消息
+   * 所有入口共用的同一条流式路径：
+   * 累积、统计（响应时间 / Token）与取消收尾都只在这里发生一次
    */
   const sendMessage = useCallback(
     async (content: string) => {
-      if (!activeConversationId) {
-        message.warning('请先创建或选择一个对话');
-        return;
-      }
-
       if (!isConfigValid) {
         message.warning('请先配置 API Key');
         setConfigPanelVisible(true);
         return;
       }
 
+      // 没有活动对话时自动创建一个
+      let conversationId = activeConversationId;
+      if (!conversationId) {
+        conversationId = createConversation();
+      }
+
+      // 获取当前对话的历史消息（在添加新消息之前，读取最新状态，
+      // 避免使用渲染时捕获的旧消息列表）
+      const stateBeforeAdd = useChatStore.getState();
+      const currentConversation = stateBeforeAdd.conversations.find(
+        (c) => c.id === conversationId
+      );
+      const historyMessages = currentConversation?.messages || [];
+
       // 添加用户消息
-      addMessage(activeConversationId, {
+      addMessage(conversationId, {
         role: 'user',
         content,
         status: 'complete',
       });
 
-      // 准备 API 消息
+      // 准备 API 消息（历史消息 + 当前消息）
       const apiMessages: APIMessage[] = [
-        ...messages.map((msg) => ({
+        ...historyMessages.map((msg) => ({
           role: msg.role,
           content: msg.content,
         })),
         { role: 'user' as const, content },
       ];
 
-      // 开始流式响应
-      startStreaming(activeConversationId);
+      // 开始流式响应（startStreaming 会重置累积内容，
+      // streamHandler.start 会重置计时与统计，不会带上一条的统计）
+      startStreaming(conversationId);
 
       try {
         const stream = sendMessageStream(apiMessages, {
@@ -111,7 +124,7 @@ export function useChat() {
       activeConversationId,
       isConfigValid,
       config,
-      messages,
+      createConversation,
       addMessage,
       startStreaming,
       appendStreamContent,
